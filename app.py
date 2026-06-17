@@ -1,3 +1,4 @@
+
 import os
 import re
 import pickle
@@ -12,7 +13,6 @@ import streamlit as st
 from google import genai
 from google.genai import types
 from pypdf import PdfReader
-
 
 APP_TITLE = "Chat hỏi đáp pháp luật về khám chữa bệnh"
 
@@ -77,11 +77,10 @@ def ensure_dirs():
 
 def get_api_key() -> str:
     """
-    Lấy Gemini API key từ Streamlit Secrets trước, sau đó mới tới biến môi trường.
-    Không đọc file .env để tránh lộ key khi commit lên GitHub.
-
-    Streamlit Cloud > App > Settings > Secrets:
-    GEMINI_API_KEY = "your_new_key"
+    Trên Streamlit Cloud: Settings -> Secrets:
+    GEMINI_API_KEY = "AIza..."
+    Local dev có thể dùng biến môi trường GEMINI_API_KEY.
+    Không đọc .env để tránh lộ key lên Git.
     """
     try:
         key = st.secrets.get("GEMINI_API_KEY", "")
@@ -94,15 +93,10 @@ def get_api_key() -> str:
     return str(key).strip()
 
 
-def get_client():
-    api_key = get_api_key()
-
+@st.cache_resource(show_spinner=False)
+def get_client(api_key: str):
     if not api_key:
-        st.error(
-            "Chưa có GEMINI_API_KEY. Hãy thêm key trong Streamlit Cloud > Settings > Secrets."
-        )
-        st.stop()
-
+        return None
     return genai.Client(api_key=api_key)
 
 
@@ -119,7 +113,6 @@ def make_chunk_id(source: str, page: int, text: str) -> str:
 
 def read_pdf(path: Path) -> List[Chunk]:
     result = []
-
     try:
         reader = PdfReader(str(path))
     except Exception as e:
@@ -128,19 +121,15 @@ def read_pdf(path: Path) -> List[Chunk]:
 
     for page_number, page in enumerate(reader.pages, start=1):
         text = clean_text(page.extract_text() or "")
-
-        if not text:
-            continue
-
-        result.append(
-            Chunk(
-                text=text,
-                source=path.name,
-                page=page_number,
-                chunk_id=make_chunk_id(path.name, page_number, text),
+        if text:
+            result.append(
+                Chunk(
+                    text=text,
+                    source=path.name,
+                    page=page_number,
+                    chunk_id=make_chunk_id(path.name, page_number, text),
+                )
             )
-        )
-
     return result
 
 
@@ -152,50 +141,54 @@ def read_txt(path: Path) -> List[Chunk]:
         return []
 
     text = clean_text(text)
-
     if not text:
         return []
 
-    return [
-        Chunk(
-            text=text,
-            source=path.name,
-            page=1,
-            chunk_id=make_chunk_id(path.name, 1, text),
-        )
-    ]
+    return [Chunk(text=text, source=path.name, page=1, chunk_id=make_chunk_id(path.name, 1, text))]
 
 
 def split_text(text: str, chunk_size: int = 850, overlap: int = 150) -> List[str]:
     words = text.split()
-
     if not words:
         return []
 
     chunks = []
     start = 0
-
     while start < len(words):
         end = min(start + chunk_size, len(words))
         part = " ".join(words[start:end]).strip()
-
         if part:
             chunks.append(part)
-
         if end >= len(words):
             break
-
         start = max(0, end - overlap)
-
     return chunks
+
+
+def list_data_files() -> List[Path]:
+    ensure_dirs()
+    return sorted([p for p in DATA_DIR.glob("*") if p.suffix.lower() in [".pdf", ".txt"]])
+
+
+def data_fingerprint() -> str:
+    """
+    Nếu dữ liệu đổi, fingerprint đổi -> app tự tạo lại index.
+    """
+    h = hashlib.sha256()
+    files = list_data_files()
+    for path in files:
+        stat = path.stat()
+        h.update(path.name.encode("utf-8"))
+        h.update(str(stat.st_size).encode("utf-8"))
+        h.update(str(int(stat.st_mtime)).encode("utf-8"))
+    return h.hexdigest()
 
 
 def load_documents() -> List[Chunk]:
     ensure_dirs()
-
     all_chunks = []
 
-    for path in sorted(DATA_DIR.glob("*")):
+    for path in list_data_files():
         if path.suffix.lower() == ".pdf":
             pages = read_pdf(path)
         elif path.suffix.lower() == ".txt":
@@ -204,28 +197,20 @@ def load_documents() -> List[Chunk]:
             continue
 
         for page_chunk in pages:
-            parts = split_text(page_chunk.text)
-
-            for idx, part in enumerate(parts, start=1):
+            for idx, part in enumerate(split_text(page_chunk.text), start=1):
                 all_chunks.append(
                     Chunk(
                         text=part,
                         source=page_chunk.source,
                         page=page_chunk.page,
-                        chunk_id=make_chunk_id(
-                            page_chunk.source,
-                            page_chunk.page,
-                            f"{idx}-{part}",
-                        ),
+                        chunk_id=make_chunk_id(page_chunk.source, page_chunk.page, f"{idx}-{part}"),
                     )
                 )
-
     return all_chunks
 
 
 def embed_texts(client, texts: List[str], task_type: str) -> np.ndarray:
     vectors = []
-
     for text in texts:
         response = client.models.embed_content(
             model=EMBED_MODEL,
@@ -240,13 +225,11 @@ def embed_texts(client, texts: List[str], task_type: str) -> np.ndarray:
 
     arr = np.array(vectors, dtype="float32")
     faiss.normalize_L2(arr)
-
     return arr
 
 
 def build_index(client) -> Tuple[int, int]:
     chunks = load_documents()
-
     if not chunks:
         raise RuntimeError("Không tìm thấy file PDF/TXT trong thư mục data/.")
 
@@ -260,25 +243,65 @@ def build_index(client) -> Tuple[int, int]:
     index.add(embeddings)
 
     ensure_dirs()
-
     faiss.write_index(index, str(INDEX_FILE))
 
+    meta = {
+        "fingerprint": data_fingerprint(),
+        "chunks": chunks,
+    }
     with META_FILE.open("wb") as f:
-        pickle.dump(chunks, f)
+        pickle.dump(meta, f)
 
     return len(chunks), embeddings.shape[1]
 
 
 def load_index():
     if not INDEX_FILE.exists() or not META_FILE.exists():
-        return None, None
+        return None, None, None
 
     index = faiss.read_index(str(INDEX_FILE))
 
     with META_FILE.open("rb") as f:
-        chunks = pickle.load(f)
+        meta = pickle.load(f)
 
-    return index, chunks
+    if isinstance(meta, dict):
+        return index, meta.get("chunks", []), meta.get("fingerprint")
+
+    # Tương thích với chunks.pkl bản cũ.
+    return index, meta, None
+
+
+def reset_index():
+    if INDEX_FILE.exists():
+        INDEX_FILE.unlink()
+    if META_FILE.exists():
+        META_FILE.unlink()
+
+
+def ensure_index_ready(client):
+    """
+    Tự động tạo/cập nhật index khi:
+    - Chưa có index.
+    - File data thay đổi.
+    """
+    if client is None:
+        return False
+
+    files = list_data_files()
+    if not files:
+        return False
+
+    index, chunks, old_fp = load_index()
+    current_fp = data_fingerprint()
+
+    if index is not None and chunks and old_fp == current_fp:
+        return True
+
+    with st.spinner("Đang tự động tạo/cập nhật chỉ mục RAG từ tài liệu..."):
+        n_chunks, dim = build_index(client)
+        st.success(f"Đã tự động tạo/cập nhật chỉ mục RAG: {n_chunks} đoạn, vector {dim} chiều.")
+
+    return True
 
 
 def lexical_score(question: str, text: str) -> float:
@@ -292,22 +315,14 @@ def lexical_score(question: str, text: str) -> float:
 
 
 def retrieve(client, question: str, top_k: int = DEFAULT_TOP_K) -> List[Tuple[Chunk, float]]:
-    index, chunks = load_index()
+    index, chunks, _ = load_index()
+    if index is None or not chunks:
+        raise RuntimeError("Chưa có chỉ mục RAG. Hệ thống chưa tạo được index từ tài liệu.")
 
-    if index is None:
-        st.warning("Chưa có chỉ mục RAG. Hãy bấm 'Tạo / cập nhật chỉ mục RAG' trước.")
-        st.stop()
-
-    q_vec = embed_texts(
-        client=client,
-        texts=[question],
-        task_type="RETRIEVAL_QUERY",
-    )
-
+    q_vec = embed_texts(client=client, texts=[question], task_type="RETRIEVAL_QUERY")
     scores, ids = index.search(q_vec, top_k * 2)
 
     results = []
-
     for pos, idx in enumerate(ids[0]):
         if idx == -1:
             continue
@@ -315,21 +330,17 @@ def retrieve(client, question: str, top_k: int = DEFAULT_TOP_K) -> List[Tuple[Ch
         chunk = chunks[idx]
         vector_score = float(scores[0][pos])
         keyword_score = lexical_score(question, chunk.text)
-
         final_score = 0.8 * vector_score + 0.2 * keyword_score
-
         results.append((chunk, final_score))
 
     results.sort(key=lambda item: item[1], reverse=True)
-
     return results[:top_k]
 
 
 def format_context(contexts: List[Tuple[Chunk, float]]) -> str:
-    context_blocks = []
-
+    blocks = []
     for idx, (chunk, score) in enumerate(contexts, start=1):
-        context_blocks.append(
+        blocks.append(
             f"""
 [Nguồn {idx}]
 Tên file: {chunk.source}
@@ -339,8 +350,7 @@ Nội dung văn bản:
 {chunk.text}
 """
         )
-
-    return "\n\n".join(context_blocks)
+    return "\n\n".join(blocks)
 
 
 def no_evidence_answer(reason: str) -> str:
@@ -361,24 +371,19 @@ Câu trả lời chỉ có giá trị tham khảo, không thay thế tư vấn p
 
 def answer_question(client, question: str, contexts: List[Tuple[Chunk, float]]) -> str:
     if not contexts:
-        return no_evidence_answer(
-            "Hệ thống không truy xuất được đoạn văn bản nào liên quan đến câu hỏi."
-        )
+        return no_evidence_answer("Hệ thống không truy xuất được đoạn văn bản nào liên quan đến câu hỏi.")
 
     best_score = contexts[0][1]
-
     if best_score < MIN_SCORE:
         return no_evidence_answer(
             f"Câu hỏi có thể nằm ngoài phạm vi tài liệu hiện có. Điểm liên quan cao nhất chỉ đạt {best_score:.3f}, thấp hơn ngưỡng an toàn {MIN_SCORE}."
         )
 
-    context_text = format_context(contexts)
-
     prompt = f"""
 {SYSTEM_PROMPT}
 
 NGỮ CẢNH VĂN BẢN LUẬT:
-{context_text}
+{format_context(contexts)}
 
 CÂU HỎI CỦA NGƯỜI DÙNG:
 {question}
@@ -394,10 +399,7 @@ YÊU CẦU RIÊNG:
     response = client.models.generate_content(
         model=GEN_MODEL,
         contents=prompt,
-        config=types.GenerateContentConfig(
-            temperature=0.1,
-            top_p=0.8,
-        ),
+        config=types.GenerateContentConfig(temperature=0.1, top_p=0.8),
     )
 
     if not response.text:
@@ -406,35 +408,15 @@ YÊU CẦU RIÊNG:
     return response.text
 
 
-def list_data_files() -> List[Path]:
-    ensure_dirs()
-
-    return sorted(
-        [
-            path
-            for path in DATA_DIR.glob("*")
-            if path.suffix.lower() in [".pdf", ".txt"]
-        ]
-    )
-
-
 def delete_data_file(path: Path):
     if path.exists():
         path.unlink()
-
-
-def reset_index():
-    if INDEX_FILE.exists():
-        INDEX_FILE.unlink()
-
-    if META_FILE.exists():
-        META_FILE.unlink()
+    reset_index()
 
 
 def init_session_state():
     if "messages" not in st.session_state:
         st.session_state.messages = []
-
     if "last_contexts" not in st.session_state:
         st.session_state.last_contexts = []
 
@@ -451,90 +433,62 @@ def render_sources(contexts: List[Tuple[Chunk, float]]):
 
     with st.expander("Các đoạn văn bản được dùng làm căn cứ"):
         for idx, (chunk, score) in enumerate(contexts, start=1):
-            st.markdown(
-                f"**Nguồn {idx}: {chunk.source}, trang {chunk.page} — điểm liên quan {score:.3f}**"
-            )
+            st.markdown(f"**Nguồn {idx}: {chunk.source}, trang {chunk.page} — điểm liên quan {score:.3f}**")
             st.write(chunk.text)
 
 
 def main():
-    st.set_page_config(
-        page_title=APP_TITLE,
-        page_icon="⚖️",
-        layout="wide",
-    )
-
+    st.set_page_config(page_title=APP_TITLE, page_icon="⚖️", layout="wide")
     ensure_dirs()
     init_session_state()
 
     st.title("⚖️ Chat hỏi đáp pháp luật về khám chữa bệnh")
     st.caption("Input: văn bản luật PDF/TXT | RAG + Streamlit + Gemini 2.5 | Output: trả lời dựa trên văn bản luật")
 
+    api_key = get_api_key()
+    client = get_client(api_key)
+
     with st.sidebar:
         st.header("Cấu hình")
 
-        if get_api_key():
-            st.success("Đã tìm thấy GEMINI_API_KEY trong Streamlit Secrets hoặc biến môi trường.")
+        if api_key:
+            st.success("Đã nhận GEMINI_API_KEY từ Streamlit Secrets.")
         else:
-            st.warning("Chưa cấu hình GEMINI_API_KEY trong Streamlit Secrets.")
+            st.error("Chưa có GEMINI_API_KEY. Vào Streamlit Cloud → Settings → Secrets để thêm key.")
 
-        top_k = st.slider(
-            "Số đoạn truy xuất",
-            min_value=3,
-            max_value=10,
-            value=DEFAULT_TOP_K,
-        )
+        top_k = st.slider("Số đoạn truy xuất", min_value=3, max_value=10, value=DEFAULT_TOP_K)
 
         st.write(f"Model trả lời: `{GEN_MODEL}`")
         st.write(f"Model embedding: `{EMBED_MODEL}`")
         st.write(f"Ngưỡng chống trả lời ngoài tài liệu: `{MIN_SCORE}`")
 
         st.divider()
-        st.subheader("Nạp văn bản luật")
-
-        uploaded_files = st.file_uploader(
-            "Thêm file PDF/TXT",
-            type=["pdf", "txt"],
-            accept_multiple_files=True,
-        )
-
-        if uploaded_files:
-            for uploaded_file in uploaded_files:
-                save_path = DATA_DIR / uploaded_file.name
-                save_path.write_bytes(uploaded_file.getbuffer())
-
-            st.success(f"Đã lưu {len(uploaded_files)} file vào thư mục data/.")
+        st.subheader("Văn bản luật")
 
         files = list_data_files()
-
         if files:
-            st.write("Văn bản đã nạp:")
-
+            st.write("Văn bản đang có trong thư mục data/:")
             for file_path in files:
                 col1, col2 = st.columns([4, 1])
-
                 with col1:
                     st.caption(f"📄 {file_path.name}")
-
                 with col2:
                     if st.button("Xóa", key=f"delete-{file_path.name}"):
                         delete_data_file(file_path)
-                        reset_index()
                         st.rerun()
         else:
             st.warning("Chưa có văn bản luật nào trong data/.")
 
+        uploaded_files = st.file_uploader("Thêm file PDF/TXT", type=["pdf", "txt"], accept_multiple_files=True)
+        if uploaded_files:
+            for uploaded_file in uploaded_files:
+                save_path = DATA_DIR / uploaded_file.name
+                save_path.write_bytes(uploaded_file.getbuffer())
+            reset_index()
+            st.success(f"Đã lưu {len(uploaded_files)} file. Hệ thống sẽ tự tạo lại index.")
+            st.rerun()
+
         st.divider()
-
-        if st.button("Tạo / cập nhật chỉ mục RAG", type="primary"):
-            client = get_client()
-
-            with st.spinner("Đang đọc văn bản luật và tạo embedding..."):
-                try:
-                    n_chunks, dim = build_index(client)
-                    st.success(f"Đã tạo chỉ mục RAG: {n_chunks} đoạn, vector {dim} chiều.")
-                except Exception as e:
-                    st.error(f"Lỗi khi tạo chỉ mục RAG: {e}")
 
         if st.button("Xóa lịch sử chat"):
             st.session_state.messages = []
@@ -543,9 +497,17 @@ def main():
 
         if st.button("Xóa index RAG"):
             reset_index()
-            st.success("Đã xóa index RAG. Hãy tạo lại trước khi hỏi.")
+            st.success("Đã xóa index RAG. Hệ thống sẽ tự tạo lại khi cần.")
 
-    client = get_client()
+    if client is None:
+        st.warning("Thiếu GEMINI_API_KEY nên chưa thể tạo index hoặc trả lời.")
+        st.stop()
+
+    try:
+        ensure_index_ready(client)
+    except Exception as e:
+        st.error(f"Lỗi khi tự động tạo/cập nhật chỉ mục RAG: {e}")
+        st.stop()
 
     st.subheader("Đặt câu hỏi pháp luật")
 
@@ -560,38 +522,29 @@ def main():
     question = st.chat_input("Nhập câu hỏi liên quan đến pháp luật khám chữa bệnh...")
 
     if question:
-        st.session_state.messages.append(
-            {
-                "role": "user",
-                "content": question,
-            }
-        )
+        st.session_state.messages.append({"role": "user", "content": question})
 
         with st.chat_message("user"):
             st.markdown(question)
 
         with st.chat_message("assistant"):
-            with st.spinner("Đang truy xuất văn bản luật liên quan..."):
-                contexts = retrieve(client, question, top_k=top_k)
+            try:
+                with st.spinner("Đang truy xuất văn bản luật liên quan..."):
+                    contexts = retrieve(client, question, top_k=top_k)
 
-            with st.spinner("Gemini 2.5 đang tạo câu trả lời dựa trên văn bản luật..."):
-                answer = answer_question(client, question, contexts)
+                with st.spinner("Gemini 2.5 đang tạo câu trả lời dựa trên văn bản luật..."):
+                    answer = answer_question(client, question, contexts)
+            except Exception as e:
+                contexts = []
+                answer = no_evidence_answer(f"Lỗi hệ thống khi xử lý câu hỏi: {e}")
 
             st.markdown(answer)
-
-            st.session_state.messages.append(
-                {
-                    "role": "assistant",
-                    "content": answer,
-                }
-            )
-
+            st.session_state.messages.append({"role": "assistant", "content": answer})
             st.session_state.last_contexts = contexts
 
     render_sources(st.session_state.last_contexts)
 
     st.divider()
-
     st.info(
         "Ứng dụng chỉ trả lời dựa trên các văn bản luật đã nạp. "
         "Nếu tài liệu không có căn cứ, hệ thống sẽ từ chối trả lời thay vì tự suy diễn."
