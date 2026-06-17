@@ -24,8 +24,12 @@ META_FILE = INDEX_DIR / "chunks.pkl"
 EMBED_MODEL = "gemini-embedding-001"
 
 # Dùng model nhẹ hơn để đỡ lỗi quota.
-GEN_MODEL = "gemini-1.5-flash"
-FALLBACK_GEN_MODELS = ["gemini-1.5-flash", "gemini-2.0-flash"]
+GEN_MODEL = "gemini-2.5-flash"
+
+FALLBACK_GEN_MODELS = [
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+]
 
 MIN_SCORE = 0.25
 DEFAULT_TOP_K = 4
