@@ -21,12 +21,13 @@ INDEX_FILE = INDEX_DIR / "faiss.index"
 META_FILE = INDEX_DIR / "chunks.pkl"
 
 EMBED_MODEL = "gemini-embedding-001"
-GEN_MODEL = "gemini-2.5-flash"
+GEN_MODEL = "gemini-2.0-flash"
+FALLBACK_GEN_MODELS = ["gemini-2.0-flash", "gemini-1.5-flash"]
 
-MIN_SCORE = 0.45
-DEFAULT_TOP_K = 5
-CHUNK_SIZE = 850
-CHUNK_OVERLAP = 150
+MIN_SCORE = 0.30
+DEFAULT_TOP_K = 8
+CHUNK_SIZE = 550
+CHUNK_OVERLAP = 120
 EMBED_BATCH_SIZE = 16
 
 SYSTEM_PROMPT = """
@@ -41,22 +42,28 @@ NGUYÊN TẮC BẮT BUỘC:
 2. Không tự bịa điều luật, số điều, mức phạt, ngày ban hành, quyền lợi hoặc quy định nếu tài liệu không nêu.
 3. Nếu tài liệu không có căn cứ, trả lời đúng câu:
    "Tôi chưa tìm thấy căn cứ trong tài liệu đã nạp để trả lời câu hỏi này."
-4. Trả lời bằng tiếng Việt.
-5. Câu trả lời phải có cấu trúc rõ ràng.
+4. Trả lời bằng tiếng Việt, rõ ràng, dễ hiểu.
+5. Không trả lời quá ngắn hoặc chung chung. Phải giải thích đủ ý theo căn cứ tìm được.
 6. Bắt buộc trích dẫn nguồn theo tên file và số trang.
+7. Nếu ngữ cảnh chỉ có tiêu đề chương/mục mà không có nội dung điều khoản cụ thể, phải nói rõ tài liệu hiện chỉ có tiêu đề hoặc chưa đủ nội dung chi tiết.
+8. Nếu có nhiều căn cứ liên quan, tổng hợp theo từng ý; không chỉ nêu một câu kết luận.
 
 ĐỊNH DẠNG OUTPUT BẮT BUỘC:
 
 ## Trả lời
-Trả lời trực tiếp câu hỏi của người dùng dựa trên văn bản luật.
+- Trả lời trực tiếp câu hỏi.
+- Viết thành 4 đến 8 gạch đầu dòng hoặc 2 đến 4 đoạn ngắn.
+- Mỗi ý quan trọng phải gắn với căn cứ trong tài liệu.
+- Nếu có điều kiện, ngoại lệ, phạm vi áp dụng thì nêu rõ.
+- Không được chỉ trả lời một câu chung chung.
 
 ## Căn cứ từ văn bản luật
 Liệt kê căn cứ đã dùng:
-- [Nguồn 1: tên file, trang X]
-- [Nguồn 2: tên file, trang Y]
+- [Nguồn 1: tên file, trang X] Tóm tắt ngắn nội dung căn cứ.
+- [Nguồn 2: tên file, trang Y] Tóm tắt ngắn nội dung căn cứ.
 
 ## Giải thích ngắn gọn
-Giải thích dễ hiểu, không suy diễn ngoài tài liệu.
+Giải thích dễ hiểu hơn cho người không chuyên, khoảng 3 đến 6 câu.
 
 ## Lưu ý
 Câu trả lời chỉ có giá trị tham khảo, không thay thế tư vấn pháp lý chính thức.
@@ -406,6 +413,36 @@ Câu trả lời chỉ có giá trị tham khảo, không thay thế tư vấn p
 """.strip()
 
 
+def generate_with_fallback(client, prompt: str) -> str:
+    """Tạo câu trả lời, tự đổi model nhẹ hơn nếu model chính quá tải."""
+    last_error = None
+
+    for model_name in FALLBACK_GEN_MODELS:
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    temperature=0.15,
+                    top_p=0.85,
+                    max_output_tokens=1800,
+                ),
+            )
+            text = getattr(response, "text", "") or ""
+            if text.strip():
+                return text.strip()
+        except Exception as exc:
+            last_error = exc
+            error_text = str(exc)
+            if "503" in error_text or "UNAVAILABLE" in error_text or "overload" in error_text.lower():
+                continue
+            raise
+
+    if last_error:
+        raise last_error
+
+    return ""
+
 def answer_question(client, question: str, contexts: List[Tuple[Chunk, float]]) -> str:
     if not contexts:
         return no_evidence_answer("Hệ thống không truy xuất được đoạn văn bản nào liên quan đến câu hỏi.")
@@ -426,20 +463,17 @@ CÂU HỎI CỦA NGƯỜI DÙNG:
 {question}
 
 YÊU CẦU RIÊNG:
-- Trả lời đúng trọng tâm câu hỏi.
+- Trả lời đúng trọng tâm câu hỏi, nhưng không được trả lời quá ngắn.
+- Phải khai thác tối đa các đoạn ngữ cảnh được cung cấp.
+- Ưu tiên nêu rõ: quy định chính, chủ thể áp dụng, điều kiện, quyền/nghĩa vụ, hệ quả pháp lý nếu tài liệu có nêu.
 - Bắt buộc dùng định dạng OUTPUT đã yêu cầu.
-- Bắt buộc ghi rõ nguồn, tên file và trang.
+- Bắt buộc ghi rõ nguồn, tên file và trang cho từng căn cứ.
 - Không dùng kiến thức bên ngoài NGỮ CẢNH VĂN BẢN LUẬT.
 - Nếu tài liệu chỉ có căn cứ một phần, hãy nói rõ phần nào có căn cứ, phần nào chưa có căn cứ.
+- Nếu chỉ tìm được tiêu đề chương/mục, không được suy diễn nội dung điều luật; hãy nói tài liệu chưa đủ chi tiết.
 """.strip()
 
-    response = client.models.generate_content(
-        model=GEN_MODEL,
-        contents=prompt,
-        config=types.GenerateContentConfig(temperature=0.1, top_p=0.8),
-    )
-
-    text = getattr(response, "text", "") or ""
+    text = generate_with_fallback(client, prompt)
     if not text.strip():
         return no_evidence_answer("Gemini không tạo được câu trả lời.")
 
@@ -485,7 +519,7 @@ def main() -> None:
     init_session_state()
 
     st.title("⚖️ Chat hỏi đáp pháp luật về khám chữa bệnh")
-    st.caption("Input: văn bản luật PDF/TXT | RAG + Streamlit + Gemini 2.5 | Output: trả lời dựa trên văn bản luật")
+    st.caption("Input: văn bản luật PDF/TXT | RAG + Streamlit + Gemini | Output: trả lời dựa trên văn bản luật")
 
     api_key = get_api_key()
     client = get_client(api_key)
@@ -581,11 +615,27 @@ def main() -> None:
                 with st.spinner("Đang truy xuất văn bản luật liên quan..."):
                     contexts = retrieve(client, question, top_k=top_k)
 
-                with st.spinner("Gemini 2.5 đang tạo câu trả lời dựa trên văn bản luật..."):
+                with st.spinner("Gemini đang tạo câu trả lời chi tiết dựa trên văn bản luật..."):
                     answer = answer_question(client, question, contexts)
             except Exception as exc:
                 contexts = []
-                answer = no_evidence_answer(f"Lỗi hệ thống khi xử lý câu hỏi: {exc}")
+                error_text = str(exc)
+                if "503" in error_text or "UNAVAILABLE" in error_text:
+                    answer = """
+## Trả lời
+Hệ thống AI đang quá tải tạm thời, vui lòng gửi lại câu hỏi sau vài giây.
+
+## Căn cứ từ văn bản luật
+Chưa thể tạo câu trả lời vì dịch vụ AI đang quá tải.
+
+## Giải thích ngắn gọn
+Đây là lỗi tạm thời từ Gemini, không phải do tài liệu hoặc câu hỏi của bạn. Bạn có thể thử lại ngay hoặc đổi model nhẹ hơn.
+
+## Lưu ý
+Câu trả lời chỉ có giá trị tham khảo, không thay thế tư vấn pháp lý chính thức.
+""".strip()
+                else:
+                    answer = no_evidence_answer(f"Lỗi hệ thống khi xử lý câu hỏi: {exc}")
 
             st.markdown(answer)
             st.session_state.messages.append({"role": "assistant", "content": answer})
