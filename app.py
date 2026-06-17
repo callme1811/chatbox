@@ -1,11 +1,10 @@
-
-import os
-import re
-import pickle
 import hashlib
+import os
+import pickle
+import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import faiss
 import numpy as np
@@ -26,7 +25,9 @@ GEN_MODEL = "gemini-2.5-flash"
 
 MIN_SCORE = 0.45
 DEFAULT_TOP_K = 5
-
+CHUNK_SIZE = 850
+CHUNK_OVERLAP = 150
+EMBED_BATCH_SIZE = 16
 
 SYSTEM_PROMPT = """
 Bạn là chatbot hỏi đáp pháp luật về khám chữa bệnh tại Việt Nam.
@@ -70,18 +71,14 @@ class Chunk:
     chunk_id: str
 
 
-def ensure_dirs():
+def ensure_dirs() -> None:
     DATA_DIR.mkdir(exist_ok=True)
     INDEX_DIR.mkdir(exist_ok=True)
 
 
 def get_api_key() -> str:
-    """
-    Trên Streamlit Cloud: Settings -> Secrets:
-    GEMINI_API_KEY = "AIza..."
-    Local dev có thể dùng biến môi trường GEMINI_API_KEY.
-    Không đọc .env để tránh lộ key lên Git.
-    """
+    """Ưu tiên Streamlit Secrets, sau đó mới đến biến môi trường."""
+    key = ""
     try:
         key = st.secrets.get("GEMINI_API_KEY", "")
     except Exception:
@@ -107,22 +104,26 @@ def clean_text(text: str) -> str:
 
 
 def make_chunk_id(source: str, page: int, text: str) -> str:
-    raw = f"{source}-{page}-{text[:120]}"
+    raw = f"{source}-{page}-{text[:160]}"
     return hashlib.md5(raw.encode("utf-8")).hexdigest()
 
 
 def read_pdf(path: Path) -> List[Chunk]:
-    result = []
+    chunks: List[Chunk] = []
     try:
         reader = PdfReader(str(path))
-    except Exception as e:
-        st.warning(f"Không đọc được PDF {path.name}: {e}")
-        return result
+    except Exception as exc:
+        st.warning(f"Không đọc được PDF {path.name}: {exc}")
+        return chunks
 
     for page_number, page in enumerate(reader.pages, start=1):
-        text = clean_text(page.extract_text() or "")
+        try:
+            text = clean_text(page.extract_text() or "")
+        except Exception:
+            text = ""
+
         if text:
-            result.append(
+            chunks.append(
                 Chunk(
                     text=text,
                     source=path.name,
@@ -130,14 +131,14 @@ def read_pdf(path: Path) -> List[Chunk]:
                     chunk_id=make_chunk_id(path.name, page_number, text),
                 )
             )
-    return result
+    return chunks
 
 
 def read_txt(path: Path) -> List[Chunk]:
     try:
         text = path.read_text(encoding="utf-8", errors="ignore")
-    except Exception as e:
-        st.warning(f"Không đọc được TXT {path.name}: {e}")
+    except Exception as exc:
+        st.warning(f"Không đọc được TXT {path.name}: {exc}")
         return []
 
     text = clean_text(text)
@@ -147,12 +148,12 @@ def read_txt(path: Path) -> List[Chunk]:
     return [Chunk(text=text, source=path.name, page=1, chunk_id=make_chunk_id(path.name, 1, text))]
 
 
-def split_text(text: str, chunk_size: int = 850, overlap: int = 150) -> List[str]:
+def split_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> List[str]:
     words = text.split()
     if not words:
         return []
 
-    chunks = []
+    chunks: List[str] = []
     start = 0
     while start < len(words):
         end = min(start + chunk_size, len(words))
@@ -167,16 +168,12 @@ def split_text(text: str, chunk_size: int = 850, overlap: int = 150) -> List[str
 
 def list_data_files() -> List[Path]:
     ensure_dirs()
-    return sorted([p for p in DATA_DIR.glob("*") if p.suffix.lower() in [".pdf", ".txt"]])
+    return sorted(path for path in DATA_DIR.glob("*") if path.suffix.lower() in {".pdf", ".txt"})
 
 
 def data_fingerprint() -> str:
-    """
-    Nếu dữ liệu đổi, fingerprint đổi -> app tự tạo lại index.
-    """
     h = hashlib.sha256()
-    files = list_data_files()
-    for path in files:
+    for path in list_data_files():
         stat = path.stat()
         h.update(path.name.encode("utf-8"))
         h.update(str(stat.st_size).encode("utf-8"))
@@ -185,8 +182,7 @@ def data_fingerprint() -> str:
 
 
 def load_documents() -> List[Chunk]:
-    ensure_dirs()
-    all_chunks = []
+    all_chunks: List[Chunk] = []
 
     for path in list_data_files():
         if path.suffix.lower() == ".pdf":
@@ -206,24 +202,58 @@ def load_documents() -> List[Chunk]:
                         chunk_id=make_chunk_id(page_chunk.source, page_chunk.page, f"{idx}-{part}"),
                     )
                 )
+
     return all_chunks
 
 
-def embed_texts(client, texts: List[str], task_type: str) -> np.ndarray:
-    vectors = []
+def _embed_batch(client, texts: List[str], task_type: str) -> List[List[float]]:
+    """Gọi embedding theo batch; nếu SDK/API không nhận batch thì tự fallback từng text."""
+    try:
+        response = client.models.embed_content(
+            model=EMBED_MODEL,
+            contents=texts,
+            config=types.EmbedContentConfig(task_type=task_type),
+        )
+        embeddings = getattr(response, "embeddings", None) or []
+        if len(embeddings) == len(texts):
+            return [item.values for item in embeddings]
+    except Exception:
+        pass
+
+    vectors: List[List[float]] = []
     for text in texts:
         response = client.models.embed_content(
             model=EMBED_MODEL,
             contents=text,
             config=types.EmbedContentConfig(task_type=task_type),
         )
-
-        if not response.embeddings:
+        embeddings = getattr(response, "embeddings", None) or []
+        if not embeddings:
             raise RuntimeError("Gemini không trả về embedding.")
+        vectors.append(embeddings[0].values)
+    return vectors
 
-        vectors.append(response.embeddings[0].values)
+
+def embed_texts(client, texts: List[str], task_type: str) -> np.ndarray:
+    if not texts:
+        raise ValueError("Danh sách văn bản để embedding đang rỗng.")
+
+    vectors: List[List[float]] = []
+    progress = st.progress(0, text="Đang tạo embedding...") if len(texts) > EMBED_BATCH_SIZE else None
+
+    for start in range(0, len(texts), EMBED_BATCH_SIZE):
+        batch = texts[start : start + EMBED_BATCH_SIZE]
+        vectors.extend(_embed_batch(client, batch, task_type))
+        if progress:
+            progress.progress(min((start + len(batch)) / len(texts), 1.0), text="Đang tạo embedding...")
+
+    if progress:
+        progress.empty()
 
     arr = np.array(vectors, dtype="float32")
+    if arr.ndim != 2 or arr.shape[0] == 0:
+        raise RuntimeError("Embedding trả về không hợp lệ.")
+
     faiss.normalize_L2(arr)
     return arr
 
@@ -231,7 +261,7 @@ def embed_texts(client, texts: List[str], task_type: str) -> np.ndarray:
 def build_index(client) -> Tuple[int, int]:
     chunks = load_documents()
     if not chunks:
-        raise RuntimeError("Không tìm thấy file PDF/TXT trong thư mục data/.")
+        raise RuntimeError("Không tìm thấy nội dung đọc được trong thư mục data/. Hãy thêm file PDF/TXT có text.")
 
     embeddings = embed_texts(
         client=client,
@@ -248,47 +278,55 @@ def build_index(client) -> Tuple[int, int]:
     meta = {
         "fingerprint": data_fingerprint(),
         "chunks": chunks,
+        "embed_model": EMBED_MODEL,
+        "dim": int(embeddings.shape[1]),
     }
-    with META_FILE.open("wb") as f:
-        pickle.dump(meta, f)
+    with META_FILE.open("wb") as file:
+        pickle.dump(meta, file)
 
-    return len(chunks), embeddings.shape[1]
+    return len(chunks), int(embeddings.shape[1])
 
 
-def load_index():
+def load_index() -> Tuple[Optional[faiss.Index], List[Chunk], Optional[str]]:
     if not INDEX_FILE.exists() or not META_FILE.exists():
-        return None, None, None
+        return None, [], None
 
-    index = faiss.read_index(str(INDEX_FILE))
-
-    with META_FILE.open("rb") as f:
-        meta = pickle.load(f)
+    try:
+        index = faiss.read_index(str(INDEX_FILE))
+        with META_FILE.open("rb") as file:
+            meta = pickle.load(file)
+    except Exception:
+        reset_index()
+        return None, [], None
 
     if isinstance(meta, dict):
-        return index, meta.get("chunks", []), meta.get("fingerprint")
+        chunks = meta.get("chunks", []) or []
+        fingerprint = meta.get("fingerprint")
+    else:
+        chunks = meta or []
+        fingerprint = None
 
-    # Tương thích với chunks.pkl bản cũ.
-    return index, meta, None
+    if index.ntotal != len(chunks):
+        reset_index()
+        return None, [], None
+
+    return index, chunks, fingerprint
 
 
-def reset_index():
-    if INDEX_FILE.exists():
-        INDEX_FILE.unlink()
-    if META_FILE.exists():
-        META_FILE.unlink()
+def reset_index() -> None:
+    for path in (INDEX_FILE, META_FILE):
+        try:
+            if path.exists():
+                path.unlink()
+        except Exception:
+            pass
 
 
-def ensure_index_ready(client):
-    """
-    Tự động tạo/cập nhật index khi:
-    - Chưa có index.
-    - File data thay đổi.
-    """
+def ensure_index_ready(client) -> bool:
     if client is None:
         return False
 
-    files = list_data_files()
-    if not files:
+    if not list_data_files():
         return False
 
     index, chunks, old_fp = load_index()
@@ -299,7 +337,7 @@ def ensure_index_ready(client):
 
     with st.spinner("Đang tự động tạo/cập nhật chỉ mục RAG từ tài liệu..."):
         n_chunks, dim = build_index(client)
-        st.success(f"Đã tự động tạo/cập nhật chỉ mục RAG: {n_chunks} đoạn, vector {dim} chiều.")
+        st.success(f"Đã tạo/cập nhật chỉ mục RAG: {n_chunks} đoạn, vector {dim} chiều.")
 
     return True
 
@@ -307,11 +345,9 @@ def ensure_index_ready(client):
 def lexical_score(question: str, text: str) -> float:
     q_words = set(re.findall(r"\w+", question.lower()))
     t_words = set(re.findall(r"\w+", text.lower()))
-
     if not q_words or not t_words:
         return 0.0
-
-    return len(q_words.intersection(t_words)) / len(q_words)
+    return len(q_words & t_words) / len(q_words)
 
 
 def retrieve(client, question: str, top_k: int = DEFAULT_TOP_K) -> List[Tuple[Chunk, float]]:
@@ -319,12 +355,13 @@ def retrieve(client, question: str, top_k: int = DEFAULT_TOP_K) -> List[Tuple[Ch
     if index is None or not chunks:
         raise RuntimeError("Chưa có chỉ mục RAG. Hệ thống chưa tạo được index từ tài liệu.")
 
+    safe_top_k = max(1, min(top_k * 2, index.ntotal))
     q_vec = embed_texts(client=client, texts=[question], task_type="RETRIEVAL_QUERY")
-    scores, ids = index.search(q_vec, top_k * 2)
+    scores, ids = index.search(q_vec, safe_top_k)
 
-    results = []
+    results: List[Tuple[Chunk, float]] = []
     for pos, idx in enumerate(ids[0]):
-        if idx == -1:
+        if idx < 0 or idx >= len(chunks):
             continue
 
         chunk = chunks[idx]
@@ -338,7 +375,7 @@ def retrieve(client, question: str, top_k: int = DEFAULT_TOP_K) -> List[Tuple[Ch
 
 
 def format_context(contexts: List[Tuple[Chunk, float]]) -> str:
-    blocks = []
+    blocks: List[str] = []
     for idx, (chunk, score) in enumerate(contexts, start=1):
         blocks.append(
             f"""
@@ -348,7 +385,7 @@ Trang: {chunk.page}
 Điểm liên quan: {score:.3f}
 Nội dung văn bản:
 {chunk.text}
-"""
+""".strip()
         )
     return "\n\n".join(blocks)
 
@@ -366,7 +403,7 @@ Không có căn cứ phù hợp trong tài liệu đã nạp.
 
 ## Lưu ý
 Câu trả lời chỉ có giá trị tham khảo, không thay thế tư vấn pháp lý chính thức.
-"""
+""".strip()
 
 
 def answer_question(client, question: str, contexts: List[Tuple[Chunk, float]]) -> str:
@@ -394,7 +431,7 @@ YÊU CẦU RIÊNG:
 - Bắt buộc ghi rõ nguồn, tên file và trang.
 - Không dùng kiến thức bên ngoài NGỮ CẢNH VĂN BẢN LUẬT.
 - Nếu tài liệu chỉ có căn cứ một phần, hãy nói rõ phần nào có căn cứ, phần nào chưa có căn cứ.
-"""
+""".strip()
 
     response = client.models.generate_content(
         model=GEN_MODEL,
@@ -402,32 +439,37 @@ YÊU CẦU RIÊNG:
         config=types.GenerateContentConfig(temperature=0.1, top_p=0.8),
     )
 
-    if not response.text:
+    text = getattr(response, "text", "") or ""
+    if not text.strip():
         return no_evidence_answer("Gemini không tạo được câu trả lời.")
 
-    return response.text
+    return text.strip()
 
 
-def delete_data_file(path: Path):
-    if path.exists():
+def safe_upload_name(filename: str) -> str:
+    name = Path(filename).name
+    name = re.sub(r"[^\w\-.()\sÀ-ỹ]", "_", name, flags=re.UNICODE)
+    return name.strip() or "uploaded_file"
+
+
+def delete_data_file(path: Path) -> None:
+    if path.exists() and path.parent.resolve() == DATA_DIR.resolve():
         path.unlink()
     reset_index()
 
 
-def init_session_state():
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
-    if "last_contexts" not in st.session_state:
-        st.session_state.last_contexts = []
+def init_session_state() -> None:
+    st.session_state.setdefault("messages", [])
+    st.session_state.setdefault("last_contexts", [])
 
 
-def render_chat_history():
+def render_chat_history() -> None:
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
 
 
-def render_sources(contexts: List[Tuple[Chunk, float]]):
+def render_sources(contexts: List[Tuple[Chunk, float]]) -> None:
     if not contexts:
         return
 
@@ -437,7 +479,7 @@ def render_sources(contexts: List[Tuple[Chunk, float]]):
             st.write(chunk.text)
 
 
-def main():
+def main() -> None:
     st.set_page_config(page_title=APP_TITLE, page_icon="⚖️", layout="wide")
     ensure_dirs()
     init_session_state()
@@ -452,9 +494,9 @@ def main():
         st.header("Cấu hình")
 
         if api_key:
-            st.success("Đã nhận GEMINI_API_KEY từ Streamlit Secrets.")
+            st.success("Đã nhận GEMINI_API_KEY.")
         else:
-            st.error("Chưa có GEMINI_API_KEY. Vào Streamlit Cloud → Settings → Secrets để thêm key.")
+            st.error("Chưa có GEMINI_API_KEY. Hãy thêm trong Streamlit Secrets hoặc biến môi trường.")
 
         top_k = st.slider("Số đoạn truy xuất", min_value=3, max_value=10, value=DEFAULT_TOP_K)
 
@@ -481,11 +523,14 @@ def main():
 
         uploaded_files = st.file_uploader("Thêm file PDF/TXT", type=["pdf", "txt"], accept_multiple_files=True)
         if uploaded_files:
+            saved = 0
             for uploaded_file in uploaded_files:
-                save_path = DATA_DIR / uploaded_file.name
+                save_name = safe_upload_name(uploaded_file.name)
+                save_path = DATA_DIR / save_name
                 save_path.write_bytes(uploaded_file.getbuffer())
+                saved += 1
             reset_index()
-            st.success(f"Đã lưu {len(uploaded_files)} file. Hệ thống sẽ tự tạo lại index.")
+            st.success(f"Đã lưu {saved} file. Hệ thống sẽ tự tạo lại index.")
             st.rerun()
 
         st.divider()
@@ -504,9 +549,13 @@ def main():
         st.stop()
 
     try:
-        ensure_index_ready(client)
-    except Exception as e:
-        st.error(f"Lỗi khi tự động tạo/cập nhật chỉ mục RAG: {e}")
+        ready = ensure_index_ready(client)
+    except Exception as exc:
+        st.error(f"Lỗi khi tự động tạo/cập nhật chỉ mục RAG: {exc}")
+        st.stop()
+
+    if not ready:
+        st.warning("Hãy thêm ít nhất một file PDF/TXT vào thư mục data/ hoặc upload ở thanh bên.")
         st.stop()
 
     st.subheader("Đặt câu hỏi pháp luật")
@@ -534,9 +583,9 @@ def main():
 
                 with st.spinner("Gemini 2.5 đang tạo câu trả lời dựa trên văn bản luật..."):
                     answer = answer_question(client, question, contexts)
-            except Exception as e:
+            except Exception as exc:
                 contexts = []
-                answer = no_evidence_answer(f"Lỗi hệ thống khi xử lý câu hỏi: {e}")
+                answer = no_evidence_answer(f"Lỗi hệ thống khi xử lý câu hỏi: {exc}")
 
             st.markdown(answer)
             st.session_state.messages.append({"role": "assistant", "content": answer})
