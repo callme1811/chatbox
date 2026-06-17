@@ -1,0 +1,14 @@
+# secrets
+.env
+.streamlit/secrets.toml
+
+# local/cache files
+__pycache__/
+*.pyc
+index/
+*.pkl
+*.index
+
+# test files
+test_medical.pdf
+test_pharmacy.pdf

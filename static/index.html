@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hỏi Đáp Pháp Luật Khám Chữa Bệnh - RAG Chatbox</title>
+    <!-- Google Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=Plus+Jakarta+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <!-- FontAwesome for Icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <!-- Custom Style Sheet -->
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <!-- Background Decorators -->
+    <div class="bg-glow bg-glow-1"></div>
+    <div class="bg-glow bg-glow-2"></div>
+    
+    <div class="app-container">
+        <!-- Sidebar Panel: Document Manager & Settings -->
+        <aside class="sidebar">
+            <div class="sidebar-header">
+                <div class="brand">
+                    <i class="fa-solid fa-scale-balanced brand-icon"></i>
+                    <div class="brand-text">
+                        <h1>Y Khoa Pháp Luật</h1>
+                        <span>RAG AI Assistant</span>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="sidebar-content">
+                <!-- API Settings Panel -->
+                <section class="sidebar-section card">
+                    <div class="section-title">
+                        <i class="fa-solid fa-key"></i>
+                        <h2>Cấu hình Gemini API</h2>
+                    </div>
+                    <div class="api-settings">
+                        <div class="input-group">
+                            <input type="password" id="api-key-input" placeholder="Nhập Gemini API Key của bạn...">
+                            <button id="save-key-btn" title="Lưu Khóa API"><i class="fa-solid fa-floppy-disk"></i></button>
+                        </div>
+                        <div class="api-status" id="api-status">
+                            <span class="status-dot dot-inactive"></span>
+                            <span class="status-text">Chưa cấu hình API Key</span>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- Document Manager Section -->
+                <section class="sidebar-section card doc-section">
+                    <div class="section-title">
+                        <i class="fa-solid fa-folder-open"></i>
+                        <h2>Cơ sở dữ liệu Luật</h2>
+                        <button id="reindex-btn" class="btn-icon" title="Lập chỉ mục lại tất cả"><i class="fa-solid fa-rotate"></i></button>
+                    </div>
+                    
+                    <div class="doc-list" id="doc-list">
+                        <!-- Documents will be loaded dynamically -->
+                        <div class="loading-docs">
+                            <i class="fa-solid fa-spinner fa-spin"></i> Đang tải danh sách...
+                        </div>
+                    </div>
+
+                    <!-- Upload Zone -->
+                    <div class="upload-zone" id="upload-zone">
+                        <i class="fa-solid fa-cloud-arrow-up upload-icon"></i>
+                        <p>Kéo thả PDF / TXT vào đây hoặc click để tải lên</p>
+                        <input type="file" id="file-input" accept=".pdf,.txt,.md" style="display: none;">
+                    </div>
+                </section>
+            </div>
+            
+            <div class="sidebar-footer">
+                <p>Phiên bản 1.0.0 &bull; Phát triển bởi Antigravity</p>
+            </div>
+        </aside>
+
+        <!-- Main Chat Panel -->
+        <main class="chat-panel">
+            <header class="chat-header">
+                <div class="header-left">
+                    <button class="toggle-sidebar-btn" id="toggle-sidebar" title="Đóng/Mở Sidebar"><i class="fa-solid fa-bars"></i></button>
+                    <div class="header-info">
+                        <h2>Trợ Lý Trực Tuyến Pháp Luật Y Tế</h2>
+                        <div class="system-status">
+                            <span class="status-indicator" id="db-status">
+                                <span class="pulse-dot"></span>
+                                <span id="db-status-text">Sẵn sàng tra cứu</span>
+                            </span>
+                        </div>
+                    </div>
+                </div>
+                <div class="header-actions">
+                    <button id="clear-chat-btn" class="btn-secondary" title="Xóa lịch sử trò chuyện"><i class="fa-solid fa-trash-can"></i> Xóa Chat</button>
+                </div>
+            </header>
+
+            <!-- Chat Message History -->
+            <div class="chat-history" id="chat-history">
+                <!-- Welcome Screen when chat history is empty -->
+                <div class="welcome-screen" id="welcome-screen">
+                    <div class="welcome-logo">
+                        <i class="fa-solid fa-brain-circuit"></i>
+                    </div>
+                    <h3>Xin chào! Tôi có thể giúp gì cho bạn?</h3>
+                    <p>Tôi là trợ lý AI được tích hợp hệ thống RAG (Truy xuất dữ liệu văn bản pháp luật). Tôi có thể hỗ trợ bạn tìm kiếm và giải đáp nhanh các quy định pháp luật về:</p>
+                    
+                    <div class="topic-grid">
+                        <div class="topic-card">
+                            <i class="fa-solid fa-hospital"></i>
+                            <h4>Khám chữa bệnh</h4>
+                            <p>Quyền lợi, nghĩa vụ người bệnh, thủ tục cấp chứng chỉ hành nghề y...</p>
+                        </div>
+                        <div class="topic-card">
+                            <i class="fa-solid fa-shield-halved"></i>
+                            <h4>Bảo hiểm y tế</h4>
+                            <p>Mức hưởng BHYT, đối tượng đóng, tuyến chuyên môn kỹ thuật...</p>
+                        </div>
+                        <div class="topic-card">
+                            <i class="fa-solid fa-pills"></i>
+                            <h4>Luật Dược phẩm</h4>
+                            <p>Quản lý chất lượng thuốc, kinh doanh dược, đơn thuốc...</p>
+                        </div>
+                    </div>
+
+                    <h4 class="suggestion-title">Gợi ý câu hỏi phổ biến:</h4>
+                    <div class="suggestions" id="suggestions-container">
+                        <button class="suggestion-chip">Quyền lợi của người bệnh được quy định thế nào trong Luật Khám chữa bệnh 2023?</button>
+                        <button class="suggestion-chip">Thời hạn của giấy phép hành nghề khám chữa bệnh là bao lâu?</button>
+                        <button class="suggestion-chip">Điều kiện để người bệnh được hưởng bảo hiểm y tế trái tuyến là gì?</button>
+                        <button class="suggestion-chip">Trách nhiệm chuyên môn của người hành nghề khi xảy ra tai biến y khoa?</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Chat Input Controls -->
+            <footer class="chat-input-container">
+                <form class="chat-input-form" id="chat-form">
+                    <textarea id="chat-input" placeholder="Đặt câu hỏi pháp luật của bạn ở đây... (Nhấn Enter để gửi, Shift + Enter để xuống dòng)" rows="1" required></textarea>
+                    <button type="submit" id="send-btn" title="Gửi câu hỏi"><i class="fa-solid fa-paper-plane"></i></button>
+                </form>
+                <div class="input-footer-text">
+                    <i class="fa-solid fa-triangle-exclamation"></i>
+                    <span>Mọi câu trả lời của AI chỉ có tính chất tham khảo dựa trên tài liệu pháp luật hiện hành và không thay thế cho tư vấn pháp lý chính thức.</span>
+                </div>
+            </footer>
+        </main>
+    </div>
+
+    <!-- Toast Notification Container -->
+    <div class="toast-container" id="toast-container"></div>
+    
+    <!-- Custom Scripts -->
+    <script src="main.js"></script>
+</body>
+</html>
