@@ -753,6 +753,7 @@ def main() -> None:
                     answer = answer_question(client, question, contexts)
 
             except Exception as exc:
+                st.exception(exc)
                 answer = friendly_error_answer(exc)
 
             st.markdown(answer)
