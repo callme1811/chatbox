@@ -2,6 +2,7 @@ import hashlib
 import os
 import pickle
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -21,14 +22,17 @@ INDEX_FILE = INDEX_DIR / "faiss.index"
 META_FILE = INDEX_DIR / "chunks.pkl"
 
 EMBED_MODEL = "gemini-embedding-001"
-GEN_MODEL = "gemini-2.0-flash"
-FALLBACK_GEN_MODELS = ["gemini-2.0-flash", "gemini-1.5-flash"]
 
-MIN_SCORE = 0.30
-DEFAULT_TOP_K = 8
-CHUNK_SIZE = 550
-CHUNK_OVERLAP = 120
-EMBED_BATCH_SIZE = 16
+# Dùng model nhẹ hơn để đỡ lỗi quota.
+GEN_MODEL = "gemini-1.5-flash"
+FALLBACK_GEN_MODELS = ["gemini-1.5-flash", "gemini-2.0-flash"]
+
+MIN_SCORE = 0.25
+DEFAULT_TOP_K = 4
+CHUNK_SIZE = 500
+CHUNK_OVERLAP = 100
+EMBED_BATCH_SIZE = 8
+MAX_CONTEXT_CHARS = 12000
 
 SYSTEM_PROMPT = """
 Bạn là chatbot hỏi đáp pháp luật về khám chữa bệnh tại Việt Nam.
@@ -40,12 +44,12 @@ NHIỆM VỤ:
 NGUYÊN TẮC BẮT BUỘC:
 1. Chỉ sử dụng thông tin trong NGỮ CẢNH VĂN BẢN LUẬT được cung cấp.
 2. Không tự bịa điều luật, số điều, mức phạt, ngày ban hành, quyền lợi hoặc quy định nếu tài liệu không nêu.
-3. Nếu tài liệu không có căn cứ, trả lời đúng câu:
+3. Nếu tài liệu không có căn cứ, trả lời đúng ý:
    "Tôi chưa tìm thấy căn cứ trong tài liệu đã nạp để trả lời câu hỏi này."
 4. Trả lời bằng tiếng Việt, rõ ràng, dễ hiểu.
-5. Không trả lời quá ngắn hoặc chung chung. Phải giải thích đủ ý theo căn cứ tìm được.
+5. Không trả lời quá ngắn hoặc chung chung. Nếu có căn cứ, phải giải thích đủ ý theo căn cứ.
 6. Bắt buộc trích dẫn nguồn theo tên file và số trang.
-7. Nếu ngữ cảnh chỉ có tiêu đề chương/mục mà không có nội dung điều khoản cụ thể, phải nói rõ tài liệu hiện chỉ có tiêu đề hoặc chưa đủ nội dung chi tiết.
+7. Nếu ngữ cảnh chỉ có tiêu đề chương/mục mà không có nội dung điều khoản cụ thể, phải nói rõ tài liệu chưa đủ nội dung chi tiết.
 8. Nếu có nhiều căn cứ liên quan, tổng hợp theo từng ý; không chỉ nêu một câu kết luận.
 
 ĐỊNH DẠNG OUTPUT BẮT BUỘC:
@@ -55,7 +59,6 @@ NGUYÊN TẮC BẮT BUỘC:
 - Viết thành 4 đến 8 gạch đầu dòng hoặc 2 đến 4 đoạn ngắn.
 - Mỗi ý quan trọng phải gắn với căn cứ trong tài liệu.
 - Nếu có điều kiện, ngoại lệ, phạm vi áp dụng thì nêu rõ.
-- Không được chỉ trả lời một câu chung chung.
 
 ## Căn cứ từ văn bản luật
 Liệt kê căn cứ đã dùng:
@@ -84,7 +87,10 @@ def ensure_dirs() -> None:
 
 
 def get_api_key() -> str:
-    """Ưu tiên Streamlit Secrets, sau đó mới đến biến môi trường."""
+    """
+    Chỉ nên đặt GEMINI_API_KEY trong Streamlit Secrets.
+    Local có thể dùng biến môi trường, nhưng không commit .env lên GitHub.
+    """
     key = ""
     try:
         key = st.secrets.get("GEMINI_API_KEY", "")
@@ -111,12 +117,13 @@ def clean_text(text: str) -> str:
 
 
 def make_chunk_id(source: str, page: int, text: str) -> str:
-    raw = f"{source}-{page}-{text[:160]}"
+    raw = f"{source}-{page}-{text[:180]}"
     return hashlib.md5(raw.encode("utf-8")).hexdigest()
 
 
 def read_pdf(path: Path) -> List[Chunk]:
     chunks: List[Chunk] = []
+
     try:
         reader = PdfReader(str(path))
     except Exception as exc:
@@ -138,6 +145,7 @@ def read_pdf(path: Path) -> List[Chunk]:
                     chunk_id=make_chunk_id(path.name, page_number, text),
                 )
             )
+
     return chunks
 
 
@@ -152,7 +160,14 @@ def read_txt(path: Path) -> List[Chunk]:
     if not text:
         return []
 
-    return [Chunk(text=text, source=path.name, page=1, chunk_id=make_chunk_id(path.name, 1, text))]
+    return [
+        Chunk(
+            text=text,
+            source=path.name,
+            page=1,
+            chunk_id=make_chunk_id(path.name, 1, text),
+        )
+    ]
 
 
 def split_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> List[str]:
@@ -162,14 +177,19 @@ def split_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVE
 
     chunks: List[str] = []
     start = 0
+
     while start < len(words):
         end = min(start + chunk_size, len(words))
         part = " ".join(words[start:end]).strip()
+
         if part:
             chunks.append(part)
+
         if end >= len(words):
             break
+
         start = max(0, end - overlap)
+
     return chunks
 
 
@@ -180,11 +200,13 @@ def list_data_files() -> List[Path]:
 
 def data_fingerprint() -> str:
     h = hashlib.sha256()
+
     for path in list_data_files():
         stat = path.stat()
         h.update(path.name.encode("utf-8"))
         h.update(str(stat.st_size).encode("utf-8"))
         h.update(str(int(stat.st_mtime)).encode("utf-8"))
+
     return h.hexdigest()
 
 
@@ -213,8 +235,83 @@ def load_documents() -> List[Chunk]:
     return all_chunks
 
 
+def is_quota_error(exc: Exception) -> bool:
+    text = str(exc)
+    return (
+        "429" in text
+        or "RESOURCE_EXHAUSTED" in text
+        or "quota" in text.lower()
+        or "rate limit" in text.lower()
+    )
+
+
+def is_overload_error(exc: Exception) -> bool:
+    text = str(exc)
+    return "503" in text or "UNAVAILABLE" in text or "overload" in text.lower()
+
+
+def friendly_error_answer(exc: Exception) -> str:
+    if is_quota_error(exc):
+        return """
+## Trả lời
+Hệ thống AI đang tạm thời vượt giới hạn sử dụng, nên chưa thể tạo câu trả lời.
+
+## Căn cứ từ văn bản luật
+Chưa thể tạo câu trả lời ở thời điểm hiện tại vì Gemini API đã hết quota hoặc vượt giới hạn theo phút/ngày.
+
+## Giải thích ngắn gọn
+Đây là lỗi quota của API, không phải do câu hỏi hoặc tài liệu pháp luật. Bạn có thể thử lại sau vài phút, đổi API key thuộc project khác, hoặc bật billing cho project Google Cloud.
+
+## Lưu ý
+Ứng dụng vẫn hoạt động, nhưng cần quota Gemini còn khả dụng để tạo câu trả lời.
+""".strip()
+
+    if is_overload_error(exc):
+        return """
+## Trả lời
+Hệ thống AI đang quá tải tạm thời, vui lòng thử lại sau vài giây.
+
+## Căn cứ từ văn bản luật
+Chưa thể tạo câu trả lời ở thời điểm hiện tại vì dịch vụ Gemini đang quá tải.
+
+## Giải thích ngắn gọn
+Đây là lỗi tạm thời từ Gemini, không phải do tài liệu hoặc câu hỏi của bạn.
+
+## Lưu ý
+Bạn có thể gửi lại câu hỏi sau vài giây.
+""".strip()
+
+    return """
+## Trả lời
+Hệ thống gặp lỗi khi xử lý câu hỏi.
+
+## Căn cứ từ văn bản luật
+Chưa thể tạo câu trả lời ở thời điểm hiện tại.
+
+## Giải thích ngắn gọn
+Vui lòng kiểm tra API key, quota Gemini, file tài liệu và thử lại.
+
+## Lưu ý
+Câu trả lời chỉ có giá trị tham khảo, không thay thế tư vấn pháp lý chính thức.
+""".strip()
+
+
+def _embed_one(client, text: str, task_type: str) -> List[float]:
+    response = client.models.embed_content(
+        model=EMBED_MODEL,
+        contents=text,
+        config=types.EmbedContentConfig(task_type=task_type),
+    )
+    embeddings = getattr(response, "embeddings", None) or []
+    if not embeddings:
+        raise RuntimeError("Gemini không trả về embedding.")
+    return embeddings[0].values
+
+
 def _embed_batch(client, texts: List[str], task_type: str) -> List[List[float]]:
-    """Gọi embedding theo batch; nếu SDK/API không nhận batch thì tự fallback từng text."""
+    """
+    Thử batch trước, nếu SDK/API không nhận batch thì fallback từng đoạn.
+    """
     try:
         response = client.models.embed_content(
             model=EMBED_MODEL,
@@ -227,18 +324,7 @@ def _embed_batch(client, texts: List[str], task_type: str) -> List[List[float]]:
     except Exception:
         pass
 
-    vectors: List[List[float]] = []
-    for text in texts:
-        response = client.models.embed_content(
-            model=EMBED_MODEL,
-            contents=text,
-            config=types.EmbedContentConfig(task_type=task_type),
-        )
-        embeddings = getattr(response, "embeddings", None) or []
-        if not embeddings:
-            raise RuntimeError("Gemini không trả về embedding.")
-        vectors.append(embeddings[0].values)
-    return vectors
+    return [_embed_one(client, text, task_type) for text in texts]
 
 
 def embed_texts(client, texts: List[str], task_type: str) -> np.ndarray:
@@ -246,13 +332,20 @@ def embed_texts(client, texts: List[str], task_type: str) -> np.ndarray:
         raise ValueError("Danh sách văn bản để embedding đang rỗng.")
 
     vectors: List[List[float]] = []
-    progress = st.progress(0, text="Đang tạo embedding...") if len(texts) > EMBED_BATCH_SIZE else None
+
+    progress = None
+    if len(texts) > EMBED_BATCH_SIZE:
+        progress = st.progress(0, text="Đang tạo embedding...")
 
     for start in range(0, len(texts), EMBED_BATCH_SIZE):
         batch = texts[start : start + EMBED_BATCH_SIZE]
         vectors.extend(_embed_batch(client, batch, task_type))
+
         if progress:
-            progress.progress(min((start + len(batch)) / len(texts), 1.0), text="Đang tạo embedding...")
+            progress.progress(
+                min((start + len(batch)) / len(texts), 1.0),
+                text="Đang tạo embedding...",
+            )
 
     if progress:
         progress.empty()
@@ -288,10 +381,20 @@ def build_index(client) -> Tuple[int, int]:
         "embed_model": EMBED_MODEL,
         "dim": int(embeddings.shape[1]),
     }
+
     with META_FILE.open("wb") as file:
         pickle.dump(meta, file)
 
     return len(chunks), int(embeddings.shape[1])
+
+
+def reset_index() -> None:
+    for path in (INDEX_FILE, META_FILE):
+        try:
+            if path.exists():
+                path.unlink()
+        except Exception:
+            pass
 
 
 def load_index() -> Tuple[Optional[faiss.Index], List[Chunk], Optional[str]]:
@@ -320,15 +423,6 @@ def load_index() -> Tuple[Optional[faiss.Index], List[Chunk], Optional[str]]:
     return index, chunks, fingerprint
 
 
-def reset_index() -> None:
-    for path in (INDEX_FILE, META_FILE):
-        try:
-            if path.exists():
-                path.unlink()
-        except Exception:
-            pass
-
-
 def ensure_index_ready(client) -> bool:
     if client is None:
         return False
@@ -352,13 +446,16 @@ def ensure_index_ready(client) -> bool:
 def lexical_score(question: str, text: str) -> float:
     q_words = set(re.findall(r"\w+", question.lower()))
     t_words = set(re.findall(r"\w+", text.lower()))
+
     if not q_words or not t_words:
         return 0.0
+
     return len(q_words & t_words) / len(q_words)
 
 
 def retrieve(client, question: str, top_k: int = DEFAULT_TOP_K) -> List[Tuple[Chunk, float]]:
     index, chunks, _ = load_index()
+
     if index is None or not chunks:
         raise RuntimeError("Chưa có chỉ mục RAG. Hệ thống chưa tạo được index từ tài liệu.")
 
@@ -367,6 +464,7 @@ def retrieve(client, question: str, top_k: int = DEFAULT_TOP_K) -> List[Tuple[Ch
     scores, ids = index.search(q_vec, safe_top_k)
 
     results: List[Tuple[Chunk, float]] = []
+
     for pos, idx in enumerate(ids[0]):
         if idx < 0 or idx >= len(chunks):
             continue
@@ -374,7 +472,7 @@ def retrieve(client, question: str, top_k: int = DEFAULT_TOP_K) -> List[Tuple[Ch
         chunk = chunks[idx]
         vector_score = float(scores[0][pos])
         keyword_score = lexical_score(question, chunk.text)
-        final_score = 0.8 * vector_score + 0.2 * keyword_score
+        final_score = 0.75 * vector_score + 0.25 * keyword_score
         results.append((chunk, final_score))
 
     results.sort(key=lambda item: item[1], reverse=True)
@@ -383,9 +481,10 @@ def retrieve(client, question: str, top_k: int = DEFAULT_TOP_K) -> List[Tuple[Ch
 
 def format_context(contexts: List[Tuple[Chunk, float]]) -> str:
     blocks: List[str] = []
+    used_chars = 0
+
     for idx, (chunk, score) in enumerate(contexts, start=1):
-        blocks.append(
-            f"""
+        block = f"""
 [Nguồn {idx}]
 Tên file: {chunk.source}
 Trang: {chunk.page}
@@ -393,7 +492,13 @@ Trang: {chunk.page}
 Nội dung văn bản:
 {chunk.text}
 """.strip()
-        )
+
+        if used_chars + len(block) > MAX_CONTEXT_CHARS:
+            break
+
+        blocks.append(block)
+        used_chars += len(block)
+
     return "\n\n".join(blocks)
 
 
@@ -414,8 +519,7 @@ Câu trả lời chỉ có giá trị tham khảo, không thay thế tư vấn p
 
 
 def generate_with_fallback(client, prompt: str) -> str:
-    """Tạo câu trả lời, tự đổi model nhẹ hơn nếu model chính quá tải."""
-    last_error = None
+    last_error: Optional[Exception] = None
 
     for model_name in FALLBACK_GEN_MODELS:
         try:
@@ -423,25 +527,34 @@ def generate_with_fallback(client, prompt: str) -> str:
                 model=model_name,
                 contents=prompt,
                 config=types.GenerateContentConfig(
-                    temperature=0.15,
+                    temperature=0.1,
                     top_p=0.85,
-                    max_output_tokens=1800,
+                    max_output_tokens=1400,
                 ),
             )
             text = getattr(response, "text", "") or ""
             if text.strip():
                 return text.strip()
+
         except Exception as exc:
             last_error = exc
-            error_text = str(exc)
-            if "503" in error_text or "UNAVAILABLE" in error_text or "overload" in error_text.lower():
+
+            # Quota thì không thử tiếp nhiều lần để khỏi tốn request.
+            if is_quota_error(exc):
+                raise exc
+
+            # Quá tải thì thử model fallback.
+            if is_overload_error(exc):
+                time.sleep(1)
                 continue
-            raise
+
+            raise exc
 
     if last_error:
         raise last_error
 
     return ""
+
 
 def answer_question(client, question: str, contexts: List[Tuple[Chunk, float]]) -> str:
     if not contexts:
@@ -474,10 +587,10 @@ YÊU CẦU RIÊNG:
 """.strip()
 
     text = generate_with_fallback(client, prompt)
-    if not text.strip():
+    if not text:
         return no_evidence_answer("Gemini không tạo được câu trả lời.")
 
-    return text.strip()
+    return text
 
 
 def safe_upload_name(filename: str) -> str:
@@ -513,35 +626,32 @@ def render_sources(contexts: List[Tuple[Chunk, float]]) -> None:
             st.write(chunk.text)
 
 
-def main() -> None:
-    st.set_page_config(page_title=APP_TITLE, page_icon="⚖️", layout="wide")
-    ensure_dirs()
-    init_session_state()
-
-    st.title("⚖️ Chat hỏi đáp pháp luật về khám chữa bệnh")
-    st.caption("Input: văn bản luật PDF/TXT | RAG + Streamlit + Gemini | Output: trả lời dựa trên văn bản luật")
-
-    api_key = get_api_key()
-    client = get_client(api_key)
-
+def render_sidebar() -> int:
     with st.sidebar:
         st.header("Cấu hình")
 
+        api_key = get_api_key()
         if api_key:
             st.success("Đã nhận GEMINI_API_KEY.")
         else:
-            st.error("Chưa có GEMINI_API_KEY. Hãy thêm trong Streamlit Secrets hoặc biến môi trường.")
+            st.error("Chưa có GEMINI_API_KEY. Hãy thêm trong Streamlit Secrets.")
 
-        top_k = st.slider("Số đoạn truy xuất", min_value=3, max_value=10, value=DEFAULT_TOP_K)
+        top_k = st.slider(
+            "Số đoạn truy xuất",
+            min_value=3,
+            max_value=8,
+            value=DEFAULT_TOP_K,
+        )
 
         st.write(f"Model trả lời: `{GEN_MODEL}`")
         st.write(f"Model embedding: `{EMBED_MODEL}`")
-        st.write(f"Ngưỡng chống trả lời ngoài tài liệu: `{MIN_SCORE}`")
+        st.write(f"Ngưỡng căn cứ: `{MIN_SCORE}`")
 
         st.divider()
         st.subheader("Văn bản luật")
 
         files = list_data_files()
+
         if files:
             st.write("Văn bản đang có trong thư mục data/:")
             for file_path in files:
@@ -555,7 +665,12 @@ def main() -> None:
         else:
             st.warning("Chưa có văn bản luật nào trong data/.")
 
-        uploaded_files = st.file_uploader("Thêm file PDF/TXT", type=["pdf", "txt"], accept_multiple_files=True)
+        uploaded_files = st.file_uploader(
+            "Thêm file PDF/TXT",
+            type=["pdf", "txt"],
+            accept_multiple_files=True,
+        )
+
         if uploaded_files:
             saved = 0
             for uploaded_file in uploaded_files:
@@ -563,6 +678,7 @@ def main() -> None:
                 save_path = DATA_DIR / save_name
                 save_path.write_bytes(uploaded_file.getbuffer())
                 saved += 1
+
             reset_index()
             st.success(f"Đã lưu {saved} file. Hệ thống sẽ tự tạo lại index.")
             st.rerun()
@@ -578,6 +694,22 @@ def main() -> None:
             reset_index()
             st.success("Đã xóa index RAG. Hệ thống sẽ tự tạo lại khi cần.")
 
+    return top_k
+
+
+def main() -> None:
+    st.set_page_config(page_title=APP_TITLE, page_icon="⚖️", layout="wide")
+    ensure_dirs()
+    init_session_state()
+
+    st.title("⚖️ Chat hỏi đáp pháp luật về khám chữa bệnh")
+    st.caption("RAG + Streamlit + Gemini | Tự động tạo index | Trả lời dựa trên tài liệu đã nạp")
+
+    top_k = render_sidebar()
+
+    api_key = get_api_key()
+    client = get_client(api_key)
+
     if client is None:
         st.warning("Thiếu GEMINI_API_KEY nên chưa thể tạo index hoặc trả lời.")
         st.stop()
@@ -585,7 +717,7 @@ def main() -> None:
     try:
         ready = ensure_index_ready(client)
     except Exception as exc:
-        st.error(f"Lỗi khi tự động tạo/cập nhật chỉ mục RAG: {exc}")
+        st.error(friendly_error_answer(exc))
         st.stop()
 
     if not ready:
@@ -611,31 +743,17 @@ def main() -> None:
             st.markdown(question)
 
         with st.chat_message("assistant"):
+            contexts: List[Tuple[Chunk, float]] = []
+
             try:
                 with st.spinner("Đang truy xuất văn bản luật liên quan..."):
                     contexts = retrieve(client, question, top_k=top_k)
 
-                with st.spinner("Gemini đang tạo câu trả lời chi tiết dựa trên văn bản luật..."):
+                with st.spinner("Gemini đang tạo câu trả lời dựa trên văn bản luật..."):
                     answer = answer_question(client, question, contexts)
+
             except Exception as exc:
-                contexts = []
-                error_text = str(exc)
-                if "503" in error_text or "UNAVAILABLE" in error_text:
-                    answer = """
-## Trả lời
-Hệ thống AI đang quá tải tạm thời, vui lòng gửi lại câu hỏi sau vài giây.
-
-## Căn cứ từ văn bản luật
-Chưa thể tạo câu trả lời vì dịch vụ AI đang quá tải.
-
-## Giải thích ngắn gọn
-Đây là lỗi tạm thời từ Gemini, không phải do tài liệu hoặc câu hỏi của bạn. Bạn có thể thử lại ngay hoặc đổi model nhẹ hơn.
-
-## Lưu ý
-Câu trả lời chỉ có giá trị tham khảo, không thay thế tư vấn pháp lý chính thức.
-""".strip()
-                else:
-                    answer = no_evidence_answer(f"Lỗi hệ thống khi xử lý câu hỏi: {exc}")
+                answer = friendly_error_answer(exc)
 
             st.markdown(answer)
             st.session_state.messages.append({"role": "assistant", "content": answer})
