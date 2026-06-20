@@ -1,5 +1,5 @@
-streamlit
-google-genai
-pypdf
-numpy
-faiss-cpu
+streamlit>=1.45
+google-genai>=1.30.0
+faiss-cpu>=1.8.0
+numpy>=1.26
+pypdf>=5.0.0
